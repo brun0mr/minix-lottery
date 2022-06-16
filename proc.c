@@ -35,8 +35,6 @@
 #include <signal.h>
 #include <assert.h>
 #include <string.h>
-#include <time.h>
-#include <stdlib.h>
 
 #include "kernel/kernel.h"
 #include "vm.h"
@@ -63,6 +61,9 @@ static int try_async(struct proc *caller_ptr);
 static int try_one(struct proc *src_ptr, struct proc *dst_ptr);
 static struct proc * pick_proc(void);
 static void enqueue_head(struct proc *rp);
+
+// For pseudo random numbers
+static int next;
 
 /* all idles share the same idle_priv structure */
 static struct priv idle_priv;
@@ -1523,6 +1524,15 @@ asyn_error:
 }
 
 /*===========================================================================*
+ *			PSEUDO RANDOM GENERATION	     * 
+ *===========================================================================*/
+#define RAND_MAX 0x7fffffff
+
+int rand() {
+	return (int) ((next = next * 4215670824 + 12345) % ((u_long) RAND_MAX + 1));
+}
+
+/*===========================================================================*
  *				enqueue					     * 
  *===========================================================================*/
 void enqueue(
@@ -1722,39 +1732,63 @@ static struct proc * pick_proc(void)
  * This function always uses the run queues of the local cpu!
  */
   register struct proc *rp;			/* process to run */
-  struct proc **rdy_head, **rdy_tail;
-  int q;				/* iterate over queues */
-  srand(time(NULL));
+  struct proc **rdy_head;
+  int q, i, aux;				/* iterate over queues */
+  int tickets[8] = { 0 }, total_tickets = 0;
   /* Check each of the scheduling queues for ready processes. The number of
    * queues is defined in proc.h, and priorities are set in the task table.
    * If there are no processes ready to run, return NULL.
    */
   rdy_head = get_cpulocal_var(run_q_head);
-  rdy_tail = get_cpulocal_var(run_q_tail);
   for (q=0; q < NR_SCHED_QUEUES; q++) {	
+	/* 	Pulamos todo o espaco de usuario, que comeca na fila 7 e termina na fila 14 
+		Dessa forma, executamos em fila round robin os processos do sistema e o processo em IDLE*/
+	if (q == 7) {
+		q += 8;
+	}
 	if(!(rp = rdy_head[q])) {
 		TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
 		continue;
-	}
-	if (rp->p_priority >= 7) {
-		rp = rdy_head[q];
-		int rnd = rand() % 16;
-		int lottery = rand() % (16 - rp->p_priority);
-		if (rnd <= lottery) {
-			break;
-		}
-		else {
-			rdy_tail[q]->p_nextready = rp;	
-			rdy_tail[q] = rp;
-			rdy_head[q] = rp->p_nextready;
-			rp->p_nextready = NULL;
-			continue;
-		}
 	}
 	assert(proc_is_runnable(rp));
 	if (priv(rp)->s_flags & BILLABLE)	 	
 		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
 	return rp;
+  }
+  /* 	Iteramos por todos os processos do sistema
+  		Para processos de usuário, adicionamos tickets a suas respectivas posicoes no vetor tickets
+		Processos com p_priority menor tem prioridade maior, e portanto sua fila recebera mais tickets*/
+  for (i = 0; i <= NR_TASKS + NR_PROCS; i++) {
+	  register struct proc *comp = proc[i];
+	  if (comp->p_priority >= 7 && comp->p_priority <= 14) {
+		  aux = comp->p_priority;
+		  if (proc_is_runnable(comp)) {
+			  tickets[aux-7] += (16-aux);
+			  total_tickets += (16-aux);
+		  }
+	  }
+  }
+  /* Aqui iteramos pelo vetor de tickets, gerando um novo numero aleatorio a cada iteracao
+  	 Se o numero gerado for menor que o numero de tickets para uma dada fila, escolhemos ela
+	 Por default, escolhemos a fila 15 se nenhuma for sorteada, pois e a fila de IDLE */
+  q = 15;
+  for (i = 0; i < 8; i++) {
+	  aux = rand() % total_tickets + 1; // Adicionamos 1 ao numero aleatorio gerado para evitar escolher filas sem nenhum processo
+	  if (tickets[i] >= aux) {
+		  q = i + 7;
+		  break;
+	  }
+	  total_tickets -= tickets[i]; // Removemos os tickets desta fila para as proximas iteracoes, a fim de tornar mais provavel que sejam escolhidas
+  }
+  /* Por fim, verificamos se e possivel executar o processo escolhido e entao o retornamos*/
+  if (rp = rdy_head[q]) {
+	  assert(proc_is_runnable(rp));
+	  if (priv(rp)->s_flags & BILLABLE)	 	
+		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+	  return rp;
+  }
+  else {
+	  TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
   }
   return NULL;
 }
